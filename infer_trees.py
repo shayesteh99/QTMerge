@@ -170,8 +170,100 @@ def star_tree(taxa, index):
 	root.add_child(Leaves[2])
 	return tree, index
 
+def _four_groups(node, working_set, ll_map):
+    """Return the (up to 4) leaf-label groups around branch (node -> node.parent).
+
+    For a binary tree these are exactly 4:
+      A, B  = the two subtrees directly under `node`
+      C     = the sibling subtree(s) of `node` under its parent
+      D     = every leaf above the parent (empty when parent is root)
+
+    When parent is the root (common ASTRAL trifurcation), the root's other
+    children each become their own group, giving [A, B, C, D] directly.
+    When parent is an internal node, C = merged siblings, D = the rest.
+    """
+    # A, B: one group per child of node
+    below = [ll_map[c] for c in node.children]
+
+    parent = node.parent
+    if parent.is_root():
+        # Each sibling of node under the root is its own group (handles
+        # both bifurcating and trifurcating roots cleanly).
+        above = [ll_map[c] for c in parent.children if c is not node]
+    else:
+        # Merge all siblings of node into one group C
+        sibling_leaves = []
+        for c in parent.children:
+            if c is not node:
+                sibling_leaves.extend(ll_map[c])
+        # D = everything not in A∪B∪C
+        covered = set(l for g in below for l in g) | set(sibling_leaves)
+        above_parent = [l for l in working_set if l not in covered]
+        above = [sibling_leaves, above_parent]
+
+    return below + above
+
+
+def get_astral_tree_pruned(trees, taxa, index, min_taxa=4):
+    """Run ASTRAL on `taxa`, iteratively removing the smallest quadripartition
+    around unreliable branches (1 - exp(-l) < 0.05) until no such branches
+    remain or fewer than `min_taxa` leaves are left.
+
+    Returns (tree, index, ghost_taxa) where ghost_taxa are the labels removed
+    during pruning.  The returned tree always corresponds exactly to the
+    surviving (non-ghosted) taxa.
+
+    The original get_astral_tree is preserved and called internally here.
+    """
+    vprint(*taxa, sep = " ")
+    working = list(taxa)
+    all_ghosts = set()
+    tree = None
+    needs_rebuild = False   # True when `working` changed after the last ASTRAL call
+
+    # while len(working) >= min_taxa:
+    tree, index, _ = get_astral_tree(trees, working, index)
+    # _, index = __label_tree__(tree, index)
+    # return tree, index, all_ghosts
+
+    needs_rebuild = False   # tree is now fresh for current `working`
+
+    # Build leaf-label map for quick group lookups
+    ll_map, _ = compute_leaf_labels_and_num_leaves(tree)
+
+    # Find all internal branches with 1 - exp(-l) < 0.05
+    bad_branches = []
+    for n in tree.traverse_internal():
+        if n.is_root():
+            continue
+        l = n.edge_length
+        if l and l < 0.05:
+        # if l is not None and (1.0 - np.exp(-l)) < 0.1:
+            bad_branches.append(n)
+
+        elif n.label and float(n.label) < 0.6:
+            bad_branches.append(n)
+
+    for n in bad_branches:
+        groups = _four_groups(n, set(working), ll_map)
+        smallest = min(groups, key=len)
+        all_ghosts.update(smallest)
+    
+
+    if len(bad_branches) >= 1:
+    	working = [t for t in working if t not in all_ghosts]
+    	tree, index, _ = get_astral_tree(trees, working, index)
+    vprint(tree)
+
+
+    vprint(all_ghosts)
+
+    _, index = __label_tree__(tree, index)
+    return tree, index, list(all_ghosts)
+
+
 def get_astral_tree(trees, taxa, index = 0):
-	# print(taxa)
+	# print(*taxa, sep = " ")
 	f = tempfile.NamedTemporaryFile(mode="w+", delete=False)
 	for t in trees:
 		pruned = t.extract_tree_with(taxa)
@@ -181,19 +273,89 @@ def get_astral_tree(trees, taxa, index = 0):
 
 	proc = subprocess.run([
 		"astral4",
-		"-i", f.name
+		"-i", f.name, 
+		"--length", "CULength",
 	], capture_output=True,
 	text=True,
 	check=True)
+	# print(proc.stdout)
 
 	tree = proc.stdout.split("\n")[0]
+	# print(tree)
 	tree_obj = read_tree_newick(tree)
+	# _, index = __label_tree__(tree_obj, index)
+	return tree_obj, index, []
+	# print(tree)
+
+	nodes = []
+	for n in tree_obj.traverse_preorder():
+		if n.is_root() or n.is_leaf() or not n.edge_length:
+			continue
+		l = n.edge_length
+		# print(l)
+		if 1-np.exp(-l) < 0.05:
+			# print(l)
+			nodes.append(n)
+
+	ghosts = []
+	for n in nodes:
+		if n.is_root():
+			continue
+		sizes = []
+		for c in n.child_nodes():
+			sizes.append(c.num_nodes(leaves=True, internal=False))
+
+		parent = n.parent
+		if parent.is_root():
+			sibling = [c for c in parent.child_nodes() if c != n][0]
+			for c in sibling.child_nodes():
+				sizes.append(c.num_nodes(leaves=True, internal=False))
+
+		else:
+			sibling = [c for c in parent.child_nodes() if c != n][0]
+			sizes.append(sibling.num_nodes(leaves=True, internal=False))
+			sizes.append(len(taxa) - sum(sizes))
+		index = np.argmin(sizes)
+		if index <2:
+			c = n.child_nodes()[index]
+			ghosts += [l.label for l in c.traverse_leaves()]
+			n.remove_child(c)
+			n.contract()
+		elif parent.is_root():
+			c = sibling.child_nodes()[index-2]
+			ghosts += [l.label for l in c.traverse_leaves()]
+			sibling.remove_child(c)
+			sibling.contract()
+		elif index == 2:
+			ghosts += [l.label for l in sibling.traverse_leaves()]
+			parent.remove_child(sibling)
+			parent.contract()
+		else:
+			parent_labels = [l.label for l in parent.traverse_leaves()]
+			ghosts += [l for l in taxa if l not in parent_labels]
+			parent.parent = None
+			tree_obj.root = parent
+
 	# print(tree_obj)
 	_, index = __label_tree__(tree_obj, index)
 	# print(tree_obj)
+	return tree_obj, index, ghosts
+
+
+def get_subtree(start_tree, taxa, index):
+	cmd = ["nw_prune", "-v", start_tree] + [str(t) for t in taxa]
+
+	proc = subprocess.run(
+		cmd,
+		capture_output=True,
+		text=True,
+		check=True
+	)
+
+	tree = proc.stdout.split("\n")[0]
+	tree_obj = read_tree_newick(tree)
+	_, index = __label_tree__(tree_obj, index)
 	return tree_obj, index
-
-
 
 def extract_quartet(trees, taxa):
 	if len(taxa) != 4:
@@ -372,7 +534,7 @@ def _flatten_taxa(group_or_groups):
             out.append(x)
     return out
 
-def test_p1_equivalence(counts, epsilon=0.05):
+def test_p1_equivalence(counts, epsilon=EPSILON_ANOMALY):
 	k = sum(counts)
 
 	if counts[0] >= counts[1] and counts[0] >= counts[2]:
@@ -577,7 +739,7 @@ def find_taxon_placement(t, tree, num_leaves, genetrees, test=False, leaf_labels
 		elif len(nc) == 1:
 			node = nc[0]
 		if node.is_leaf() and node.parent in visited:
-			return node
+			return node, 1
 
 		nc = node.children
 		taxa = []
@@ -588,16 +750,18 @@ def find_taxon_placement(t, tree, num_leaves, genetrees, test=False, leaf_labels
 		for c in parent.children:
 			if c != node:
 				taxa.append(leaf_labels[c])
+		# taxa.append([l for l in leaf_labels[tree.root] if l not in leaf_labels[parent]])
 
 		taxa.append([t])
 		# q = extract_quartet(genetrees, taxa+[t])
 		# print(taxa)
 		q = count_all_topos(genetrees, taxa)
+		# pval = -1
 		if test:
 			pval = test_p1_equivalence(q)
-			if pval < 0.05:
-				return None
-		# print(q)
+			if pval < ALPHA_QUARTET:
+				return None, pval
+		# print(taxa, q)
 
 		if q[2] > q[1] and q[2] > q[0]:
 		# if [taxa[0],t] in q or [t,taxa[0]] in q:
@@ -614,7 +778,7 @@ def find_taxon_placement(t, tree, num_leaves, genetrees, test=False, leaf_labels
 				# dir="down"
 				if node.parent in visited:
 				# if prev == 'down':
-					return node
+					return node, 1
 				visited.add(node.parent)
 				for c in node.parent.children:
 					if c != node:
@@ -627,8 +791,84 @@ def find_taxon_placement(t, tree, num_leaves, genetrees, test=False, leaf_labels
 		# if prev and prev != dir and not node.parent.is_root():
 		if nextnode in visited:
 			if nextnode == node.parent:
-				return node
-			return nextnode
+				return node, 1
+			return nextnode, 1
+
+		# prev = dir
+		node = nextnode
+
+
+
+def find_taxon_placement_new(t, tree, num_leaves, genetrees, test=False, leaf_labels=None):
+	node = find_middle_branch(tree, num_leaves)
+	if leaf_labels is None:
+		leaf_labels = compute_leaf_labels(tree)
+	visited = set()
+	prev = None
+	while True:
+		visited.add(node)
+		print(node.label)
+		nc = node.children
+		if len(nc) == 1 and nc[0] in visited:
+			node = node.parent
+		elif len(nc) == 1:
+			node = nc[0]
+		if node.is_leaf() and node.parent in visited:
+			return node, 1
+
+		nc = node.children
+		taxa = []
+		for c in nc:
+			taxa.append(leaf_labels[c])
+
+		# parent = node.parent
+		# for c in parent.children:
+		# 	if c != node:
+		# 		taxa.append(leaf_labels[c])
+		taxa.append([l for l in leaf_labels[tree.root] if l not in leaf_labels[node]])
+
+		taxa.append([t])
+		# q = extract_quartet(genetrees, taxa+[t])
+		# print(taxa)
+		q = count_all_topos(genetrees, taxa)
+		# print(taxa, q)
+		pval = -1
+		if test:
+			pval = test_p1_equivalence(q)
+			if pval < ALPHA_QUARTET:
+				return None, pval
+		print(taxa, q, pval)
+
+		if q[2] > q[1] and q[2] > q[0]:
+		# if [taxa[0],t] in q or [t,taxa[0]] in q:
+			# dir = "down"
+			nextnode = nc[0]
+
+		elif q[1] > q[2] and q[1] > q[0]:
+		# elif [taxa[1],t] in q or [t,taxa[1]] in q:
+			# dir = "down"
+			nextnode = nc[1]
+
+		else:
+			if node.parent.is_root():
+				# dir="down"
+				if node.parent in visited:
+				# if prev == 'down':
+					return node, 1
+				visited.add(node.parent)
+				for c in node.parent.children:
+					if c != node:
+						nextnode = c
+						break
+			else:
+				# dir="up"
+				nextnode = node.parent
+		# print(nextnode.label)
+		# if prev and prev != dir and not node.parent.is_root():
+		if nextnode in visited:
+			if nextnode == node.parent:
+				return node, 1
+			return nextnode, 1
 
 		# prev = dir
 		node = nextnode
@@ -765,11 +1005,12 @@ def merge_trees(genetrees, tree1, tree2, placements, ghosts):
 
     if tree2_leaf_count < 4:
         for l in tree2.traverse_leaves():
-            place = find_taxon_placement(l.label, tree1, tree1_num_leaves,
+            place, pval = find_taxon_placement_new(l.label, tree1, tree1_num_leaves,
                                          genetrees, test=True,
                                          leaf_labels=tree1_leaf_labels)
             if place is None:
-                ghosts.append(l.label)
+                vprint([l.label, pval])
+                ghosts.append([l.label, pval])
                 continue
             if place.edge_length == 0:
                 place = place.parent
@@ -789,6 +1030,8 @@ def merge_trees(genetrees, tree1, tree2, placements, ghosts):
     all_tree1_leaves = tree1_leaf_labels[tree1.root]
     node_leaves_set = set(tree1_leaf_labels[node])
     taxa.append([l for l in all_tree1_leaves if l not in node_leaves_set])
+    vprint(taxa)
+    vprint([t[0].label for t in tree1_subs])
 
     # ---- get 4 representative taxa groups for tree2 ----
     tree2_taxa = []
@@ -799,6 +1042,8 @@ def merge_trees(genetrees, tree1, tree2, placements, ghosts):
             tree2_taxa.append(tree2_leaf_labels[cc])
             tree2_subs.append([cc, 0])
 
+    vprint(tree2_taxa)
+    vprint(tree1_subs)
     vprint("rerooted: ", tree2)
 
     # ---- assignment step (original logic; no robustness gate) ----
@@ -807,18 +1052,35 @@ def merge_trees(genetrees, tree1, tree2, placements, ghosts):
     # insertions cause label collisions across the 4 groups, and ghosting
     # those would corrupt the recursion structure.
     assignments = []
+    p_values = {}
     for t in tree2_taxa:
-        q = count_all_topos(genetrees, taxa + [t])
-        if q[2] >= q[1] and q[2] >= q[0]:
-            assignments.append(0)
-        elif q[1] >= q[2] and q[1] >= q[0]:
-            assignments.append(1)
-        else:
-            assignments.append(2)
+        to_check = t.copy()
+        assignments.append(-1)
+        while len(to_check) > 0:
+            taxon = to_check.pop(0)
+            q = count_all_topos(genetrees, taxa + [[taxon]])
+            p_val = test_p1_equivalence(q)
+            vprint(taxa + [[taxon]], q, p_val < ALPHA_QUARTET)
+            if p_val < ALPHA_QUARTET:
+                p_values[taxon] = p_val
+                continue
+            # if p_val < ALPHA_QUARTET:
+            # 	p_values.append(p_val)
+            # 	assignments.append(-1)
+            elif q[2] >= q[1] and q[2] >= q[0]:
+                assignments[-1] = 0
+            elif q[1] >= q[2] and q[1] >= q[0]:
+                assignments[-1] = 1
+            else:
+                assignments[-1] = 2
+            break
 
+    vprint(assignments)
     counts = {}
     for i, a in enumerate(assignments):
         counts.setdefault(a, []).append(i)
+
+    vprint(counts)
 
     tree1_subtrees = create_subtrees(tree1, tree1_subs, taxa)
 
@@ -830,6 +1092,12 @@ def merge_trees(genetrees, tree1, tree2, placements, ghosts):
     # and dumping all of tree2 down one branch corrupts the recursion.
     if len(counts) == 1 and len(tree2_taxa) >= 2:
         only = next(iter(counts))
+        if only == -1:
+        	for i in range(4):
+        		for t in tree2_taxa[i]:
+        			ghosts.append([t, p_values[t]])
+        	return
+
         out = [t for i, group in enumerate(taxa) if i != only for t in group]
         which = [1] * len(tree2_taxa)
         for i in range(len(tree2_taxa)):
@@ -837,7 +1105,6 @@ def merge_trees(genetrees, tree1, tree2, placements, ghosts):
             if len(rest) < 3:
                 continue
             q = count_all_topos(genetrees, rest + [out])
-            # Strict '>' to match original — on a tie we leave `which` alone.
             if q[0] > q[1] and q[0] > q[2]:
                 which[0 + int(i <= 0)] = 0
                 which[1 + int(i <= 1)] = 0
@@ -862,11 +1129,94 @@ def merge_trees(genetrees, tree1, tree2, placements, ghosts):
     tree2_subtrees = divide_tree(tree2, groups)
     max_group = max(len(counts[g]) for g in counts)
 
-    if max_group < 3:
+    # print(counts)
+
+    if -1 in counts:
+        # if max_group > 1 or len(counts[-1]) > 1:
+        for i in counts[-1]:
+            # print(i, " added to ghosts")
+            for t in tree2_taxa[i]:
+                ghosts.append([t, p_values[t]])
+
+        if len(counts[-1]) == 1:
+            if max_group == 3:
+                for i, g in enumerate(counts):
+                    if g != -1:
+                        # print(i, "went with ", g)
+                        merge_trees(genetrees, tree1_subtrees[g], tree2_subtrees[i],
+                            placements, ghosts)
+            elif max_group == 2:
+                # for i, g in enumerate(counts):
+                #     if g == -1:
+                #         continue
+                #     if len(counts[g]) == 1:
+                #         print(i, "went with tree 1")
+                #     else:
+                #         print(i, "went with ", g)
+                for i, g in enumerate(counts):
+                    if g == -1:
+                        continue
+                    if len(counts[g]) == 1:
+                        new_tree = Tree()
+                        new_tree.root = copy_subtree(tree1_copy_root)
+                        merge_trees(genetrees, new_tree, tree2_subtrees[i],
+                                    placements, ghosts)
+                    else:
+                        merge_trees(genetrees, tree1_subtrees[g], tree2_subtrees[i],
+                            placements, ghosts)
+            else:
+                # print(assignments, counts)
+                # for i, g in enumerate(counts):
+                #     print(i, "went with ", g)
+                # i = counts[-1][0]
+                # if i % 2 == 0:
+                #     g = assignments[i+1]
+                # else:
+                #     g = assignments[i-1]
+                # print(i, "went with ", g)
+
+                for i, g in enumerate(counts):
+                    if g == -1:
+                        continue
+                    merge_trees(genetrees, tree1_subtrees[g], tree2_subtrees[i],
+                            placements, ghosts)
+
+                # i = counts[-1][0]
+                # if i % 2 == 0:
+                #     g = assignments[i+1]
+                # else:
+                #     g = assignments[i-1]
+                # merge_trees(genetrees, tree1_subtrees[g], tree2_subtrees[i],
+                #             placements, ghosts)
+
+        else:
+            # for i, g in enumerate(counts):
+            #     if g != -1:
+            #         print(i, "went with tree 1")
+            for i, g in enumerate(counts):
+                if g != -1:
+                    if len(counts[g]) > 1:
+                        merge_trees(genetrees, tree1_subtrees[g], tree2_subtrees[i],
+                                    placements, ghosts)
+                    else:
+                        new_tree = Tree()
+                        new_tree.root = copy_subtree(tree1_copy_root)
+                        merge_trees(genetrees, new_tree, tree2_subtrees[i],
+                                    placements, ghosts)
+
+    elif max_group < 3:
+        # for i, g in enumerate(counts):
+        #     print(i, "went with ", g)
         for i, g in enumerate(counts):
             merge_trees(genetrees, tree1_subtrees[g], tree2_subtrees[i],
                         placements, ghosts)
     else:
+        # for i, g in enumerate(counts):
+        #     if len(counts[g]) == 1:
+        #         print(i, "went with tree 1")
+        #     else:
+        #         print(i, "went with ", g)
+
         for i, g in enumerate(counts):
             if len(counts[g]) == 1:
                 new_tree = Tree()
@@ -875,7 +1225,7 @@ def merge_trees(genetrees, tree1, tree2, placements, ghosts):
                             placements, ghosts)
             else:
                 merge_trees(genetrees, tree1_subtrees[g], tree2_subtrees[i],
-                            placements, ghosts)
+                        placements, ghosts)
 
 
 def create_full_tree(rev_placements, tree1, tree2, genetrees, index):
@@ -921,8 +1271,9 @@ def create_full_tree(rev_placements, tree1, tree2, genetrees, index):
             # quartet groups [{leaf_a},{leaf_b},leaf_up,leaf_down] are disjoint,
             # so count_all_topos returns deterministic (k,0,0)-shape counts and
             # is_quartet_reliable returns True — gate is a no-op.
-            if not is_quartet_reliable(q):
-                ghosts_collected.extend(rev_placements[p])
+            pval = test_p1_equivalence(q)
+            if pval < ALPHA_QUARTET:
+                ghosts_collected.extend([[p, pval] for p in rev_placements[p]])
                 continue
 
             node = full_tree_ltn[p]
@@ -975,7 +1326,7 @@ def create_full_tree(rev_placements, tree1, tree2, genetrees, index):
             subtree = fast_extract(tree2_pt, rev_placements[p])
             subtree_ll, num_leaves = compute_leaf_labels_and_num_leaves(subtree)
 
-            up_node = find_taxon_placement(leaf_up[0], subtree, num_leaves,
+            up_node, _ = find_taxon_placement_new(leaf_up[0], subtree, num_leaves,
                                            genetrees, leaf_labels=subtree_ll)
             label = subtree.root.label
             subtree.root.edge_length = None
@@ -985,7 +1336,7 @@ def create_full_tree(rev_placements, tree1, tree2, genetrees, index):
             subtree.root.label = label
             subtree.root.edge_length = 1
             subtree_ll, num_leaves = compute_leaf_labels_and_num_leaves(subtree)
-            down_node = find_taxon_placement(leaf_down[0], subtree,
+            down_node, _ = find_taxon_placement_new(leaf_down[0], subtree,
                                              num_leaves, genetrees,
                                              leaf_labels=subtree_ll)
 
@@ -1006,8 +1357,9 @@ def create_full_tree(rev_placements, tree1, tree2, genetrees, index):
                 # tree1; taxa1, taxa2 from tree2-extracted subtree) are disjoint
                 # and free of create_subtrees representative leaves, so counts
                 # are decisive and is_quartet_reliable is True.
-                if not is_quartet_reliable(q):
-                    ghosts_collected.extend(rev_placements[p])
+                pval = test_p1_equivalence(q)
+                if pval < ALPHA_QUARTET:
+                    ghosts_collected.extend([[p, pval] for p in rev_placements[p]])
                     continue
 
                 # Original tie-breaking: priority q[0] > q[2] > q[1].
@@ -1144,38 +1496,39 @@ def infer_tree(leaves, genetrees, index, ghosts=None):
 
 
 def merge_all_subtrees(input_trees, genetrees, index, ghosts = []):
-	if len(input_trees) == 1:
-		return input_trees[0], index, ghosts
-	new_trees = []
-	mid = len(input_trees)//2
-	if len(input_trees) % 2 == 1:
-		new_trees.append(input_trees[-1])
-	# print(len(input_trees))
-	for i in range(mid):
-		vprint("="*200)
-		placements = {}
-		tree1 = input_trees[i]
-		tree2 = input_trees[i+mid]
-		vprint(tree1)
-		vprint(tree2)
-		merge_trees(genetrees, read_tree_newick(tree1.newick()), read_tree_newick(tree2.newick()), placements, ghosts)
-		vprint(placements)
+    if len(input_trees) == 1:
+        return input_trees[0], index, ghosts
+    new_trees = []
+    mid = len(input_trees)//2
+    if len(input_trees) % 2 == 1:
+        new_trees.append(input_trees[-1])
+    # print(len(input_trees))
+    for i in range(mid):
+        vprint("="*200)
+        placements = {}
+        tree1 = input_trees[i]
+        tree2 = input_trees[i+mid]
+        vprint(tree1)
+        vprint(tree2)
+        merge_trees(genetrees, read_tree_newick(tree1.newick()), read_tree_newick(tree2.newick()), placements, ghosts)
+        # print(ghosts)
+        vprint(placements)
 
-		rev_placements = {}
-		for p in placements:
-			if placements[p] == tree1.root.children[1].label:
-				placements[p] = tree1.root.children[0].label
-			if placements[p] not in rev_placements:
-				rev_placements[placements[p]] = []
-			rev_placements[placements[p]].append(p)
+        rev_placements = {}
+        for p in placements:
+            if placements[p] == tree1.root.children[1].label:
+                placements[p] = tree1.root.children[0].label
+            if placements[p] not in rev_placements:
+                rev_placements[placements[p]] = []
+            rev_placements[placements[p]].append(p)
 
-		vprint(rev_placements)
-		full_tree, index = create_full_tree(rev_placements, tree1, tree2, genetrees, index)
-		ghosts.extend(getattr(full_tree, '_pending_ghosts', []))
-		new_trees.append(full_tree)
-		vprint(full_tree)
+        vprint(rev_placements)
+        full_tree, index = create_full_tree(rev_placements, tree1, tree2, genetrees, index)
+        ghosts.extend(getattr(full_tree, '_pending_ghosts', []))
+        new_trees.append(full_tree)
+        vprint(full_tree)
 
-	return merge_all_subtrees(new_trees, genetrees, index, ghosts)
+    return merge_all_subtrees(new_trees, genetrees, index, ghosts)
 
 def main():
 	parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -1183,6 +1536,11 @@ def main():
 	parser.add_argument('-s', '--seed', required=False, default=1142, help="Random Seed")
 	parser.add_argument('-m', '--min_size', required=False, default="sqrt", help="Minimum size of each subtree")
 	parser.add_argument("-v", "--verbose", action="store_true", help="enable verbose output")
+	parser.add_argument('--start_tree', required=False, help="Start tree")
+	parser.add_argument('--prune', action="store_true",
+	                    help="Use pruned ASTRAL: iteratively remove the smallest "
+	                         "quadripartition of unreliable branches (1-exp(-l)<0.05) "
+	                         "before merging; removed taxa become ghosts")
 	# parser.add_argument('-i', '--input', required=True, help="Input Trees")
 	# parser.add_argument('-g', '--gene_trees', required=True, help="Gene tree file")
 	# parser.add_argument('-a', '--annot', required=False, help="Annotation file")
@@ -1210,61 +1568,145 @@ def main():
 		trees = [read_tree_newick(t) for t in trees]
 		preprocessed = preprocess_trees(trees) 
 
-	# stree = read_tree_newick("((((65:0.05020870,(((((53:0.01578979,83:0.01578979):0.00767264,9:0.02346243):0.00456874,28:0.02803117):0.01649611,((62:0.02399946,17:0.02399946):0.01252535,(67:0.02908889,85:0.02908889):0.00743592):0.00800246):0.00308367,((((((38:0.02546873,68:0.02546873):0.00572046,((8:0.01187262,75:0.01187262):0.01673997,(48:0.00538162,14:0.00538162):0.02323098):0.00257660):0.00277513,81:0.03396432):0.00251264,(96:0.03554466,72:0.03554466):0.00093230):0.00997261,(87:0.03849819,(56:0.03389305,((63:0.00586389,66:0.00586389):0.01315401,(76:0.01847970,(52:0.00041249,18:0.00041249):0.01806721):0.00053819):0.01487515):0.00460514):0.00795138):0.00023663,((57:0.01969415,2:0.01969415):0.02116783,(49:0.03098632,44:0.03098632):0.00987566):0.00582421):0.00092475):0.00259775):0.00085173,((((((((22:0.03052066,16:0.03052066):0.00333398,93:0.03385465):0.00773149,((82:0.02236742,33:0.02236742):0.01618609,((92:0.01480158,88:0.01480158):0.00773985,(64:0.01642121,78:0.01642121):0.00612022):0.01601208):0.00303263):0.00411416,71:0.04570030):0.00009290,((((59:0.00116533,1:0.00116533):0.01051930,(73:0.01016602,34:0.01016602):0.00151861):0.00312740,7:0.01481204):0.02978257,(((95:0.02959739,(24:0.01473318,23:0.01473318):0.01486421):0.00053564,(12:0.02539142,((41:0.00397066,90:0.00397066):0.01146564,27:0.01543630):0.00995513):0.00474160):0.0143147,(((11:0.00838973,69:0.00838973):0.02280229,(86:0.02378535,3:0.02378535):0.00740667):0.00909810,(((25:0.02780867,55:0.02780867):0.00819224,((43:0.02814893,(46:0.01003381,(21:0.00900962,13:0.00900962):0.00102419):0.01811512):0.00122510,((6:0.00560383,79:0.00560383):0.01007986,29:0.01568369):0.01369034):0.00662688):0.00223613,(51:0.02065393,40:0.02065393):0.01758311):0.00205308):0.00415759):0.00014690):0.00119858):0.00161079,(74:0.04337825,((89:0.03569711,(37:0.02853480,(26:0.00249619,84:0.00249619):0.02603861):0.00716230):0.00480993,((((61:0.00333772,50:0.00333772):0.01837642,39:0.02171414):0.01313987,(31:0.02513686,32:0.02513686):0.00971715):0.00027384,45:0.03512785):0.00537918):0.00287122):0.00402574):0.00189301,(((77:0.00418433,30:0.00418433):0.02798003,(15:0.03001031,((80:0.01436022,97:0.01436022):0.00675751,20:0.02111772):0.00889259):0.00215405):0.01665062,(((((47:0.00607741,54:0.00607741):0.00674951,10:0.01282692):0.00808803,60:0.02091495):0.00636287,(19:0.01966193,4:0.01966193):0.00761588):0.00188079,((35:0.01742653,36:0.01742653):0.00600927,58:0.02343580):0.00572280):0.01965638):0.00048202):0.00037147,((70:0.01429235,94:0.01429235):0.02971623,(42:0.02921620,91:0.02921620):0.01479238):0.00565989):0.00139196):0.00008767,(100:0.03607388,(99:0.03204718,98:0.03204718):0.00402671):0.01507422):0.05114810,0:0.10229621);")
-	# __label_tree__(stree)
-	# print(stree)
-
-	# num_leaves = compute_num_leaves(stree)
-	# place = find_taxon_placement('5', stree, num_leaves, trees)
-	# print(place.label)
-	# return
-
 	leaves = set()
 	for t in trees:
 		__label_tree__(t)
 		leaves |= set([l.label for l in t.traverse_leaves()])
 	leaves = [l for l in leaves]
 
+
 	if args.min_size == "sqrt":
 		m = max(m, int(np.sqrt(len(leaves))))
-	vprint(m)
+
+	vprint("+" * 300)
+	vprint("Creating Subtrees")
 
 	random.shuffle(leaves)
 	num_trees = len(leaves) // m
+	ghosts = []
 	if num_trees <= 1:
-		inferred_tree, _ = get_astral_tree(trees, leaves)
-		ghosts = []
+		if args.start_tree:
+			inferred_tree = read_tree_newick(args.start_tree)
+		else:
+			inferred_tree, _, ghosts = get_astral_tree(trees, leaves)
+			# _, index = __label_tree__(inferred_tree, index)
 	else:
 		index = 0
-		taxa_subsets = [[] for _ in range(num_trees)]
 		input_trees = []
-		for i in range(len(leaves)):
-			taxa_subsets[i % num_trees].append(leaves[i])
-		for i in range(num_trees):
-			tree, index = get_astral_tree(trees, taxa_subsets[i], index)
-			input_trees.append(tree)
+		if args.prune:
+			# Dynamic-pool approach: randomly pick m taxa each round, run
+			# get_astral_tree_pruned, and put the pruned-off ghosts back into
+			# the pool so they get another chance in a later ASTRAL batch.
+			# Only the ghosts produced by the LAST batch (when the pool is
+			# exhausted) are kept as permanent ghosts for end-placement.
+			pool = list(leaves)   # already shuffled
+			while len(pool) > m:
+				batch = random.sample(pool, m)
+				batch_set = set(batch)
+				pool = [t for t in pool if t not in batch_set]
+				tree, index, g = get_astral_tree_pruned(trees, batch, index)
+				pool = g + pool   # pruned taxa re-enter pool for future batches
+				# ghosts += g
+				input_trees.append(tree)
+			# Last batch: remaining taxa; ghosts here are permanent
+			if pool:
+				if len(pool) < 4:
+					ghosts += [[p, 1] for p in pool]
+				else:
+					tree, index, g = get_astral_tree_pruned(trees, pool, index)
+					ghosts += [[p, 1] for p in g]
+					input_trees.append(tree)
+		else:
+			# Original fixed-subset approach (unchanged)
+			taxa_subsets = [[] for _ in range(num_trees)]
+			for i in range(len(leaves)):
+				taxa_subsets[i % num_trees].append(leaves[i])
+			for i in range(num_trees):
+				if args.start_tree:
+					tree, index = get_subtree(args.start_tree, taxa_subsets[i], index)
+				else:
+					tree, index, g = get_astral_tree(trees, taxa_subsets[i], index)
+					_, index = __label_tree__(tree, index)
+					ghosts += g
+				# print(tree)
+				input_trees.append(tree)
+		# return
 
-		inferred_tree, index, ghosts = merge_all_subtrees(input_trees, preprocessed, index)
+		vprint("+" * 300)
+		vprint("Merging Subtrees")
+		inferred_tree, index, ghosts = merge_all_subtrees(input_trees, preprocessed, index, ghosts)
 
 	# inferred_tree, index, ghosts = infer_tree(leaves, trees, index = 0)
+	vprint("+" * 300)
+	vprint("Adding Ghost Taxa")
 	vprint(ghosts)
 	vprint(inferred_tree)
 
-	num_leaves = compute_num_leaves(inferred_tree)
-	for l in ghosts:
-		node = find_taxon_placement(l, inferred_tree, num_leaves, preprocessed)
-		parent = node.parent
-		parent.remove_child(node)
-		newparent = Node(label = "I"+str(index), edge_length = 1)
-		index+=1
-		newleaf = Node(label = l, edge_length = 1)
-		newparent.add_child(node)
-		newparent.add_child(newleaf)
-		parent.add_child(newparent)
+	ghosts = sorted(ghosts, key=lambda t: t[1])[::-1]
+	# ghosts = [g[0] for g in ghosts]
+	# print(len(ghosts))
 
-		num_leaves[newleaf] = 1
-		num_leaves[newparent] = num_leaves[node] + 1
-		num_leaves[parent] += 1
+	num_leaves = compute_num_leaves(inferred_tree)
+
+	repeat = True
+	while repeat and len(ghosts) > 0: 
+		repeat = False
+	# for l in ghosts:
+		n = len(ghosts)
+		for _ in range(n):
+			l = ghosts.pop(0)
+			vprint("=" * 300)
+			taxa = l[0]
+			pval = l[1]
+			vprint(taxa, pval)
+			node, pval = find_taxon_placement_new(taxa, inferred_tree, num_leaves, preprocessed, test = True)
+			if not node:
+				ghosts.append([taxa,pval])
+				continue
+			repeat = True
+			vprint(node.label)
+			parent = node.parent
+			parent.remove_child(node)
+			newparent = Node(label = "I"+str(index), edge_length = 1)
+			index+=1
+			newleaf = Node(label = taxa, edge_length = 1)
+			newparent.add_child(node)
+			newparent.add_child(newleaf)
+			parent.add_child(newparent)
+
+			num_leaves[newleaf] = 1
+			num_leaves[newparent] = num_leaves[node] + 1
+			num_leaves[parent] += 1
+
+			vprint(inferred_tree)
+
+	vprint("placing the rest:")
+	# print(ghosts)
+	ghosts = sorted(ghosts, key=lambda t: t[1])[::-1]
+	# print(ghosts)
+	if len(ghosts) > 0:
+		vprint(len(ghosts))
+		for l in ghosts:
+			vprint("=" * 300)
+			taxa = l[0]
+			pval = l[1]
+			vprint(taxa, pval)
+			node, pval = find_taxon_placement_new(taxa, inferred_tree, num_leaves, preprocessed, test = False)
+			vprint(node.label)
+			parent = node.parent
+			parent.remove_child(node)
+			newparent = Node(label = "I"+str(index), edge_length = 1)
+			index+=1
+			newleaf = Node(label = taxa, edge_length = 1)
+			newparent.add_child(node)
+			newparent.add_child(newleaf)
+			parent.add_child(newparent)
+
+			num_leaves[newleaf] = 1
+			num_leaves[newparent] = num_leaves[node] + 1
+			num_leaves[parent] += 1
+
+			vprint(inferred_tree)
 
 	inferred_tree.write_tree_newick(args.outfile)
 	# print(inferred_tree)
