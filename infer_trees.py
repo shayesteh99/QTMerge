@@ -37,8 +37,11 @@ ADAPTIVE_QUARTETS = "off"
 COUNTER_MODE = os.environ.get("QTMERGE_COUNTER", "python")
 ADAPTIVE_MIN_TREES = int(os.environ.get("QTMERGE_ADAPTIVE_MIN_TREES", "500"))
 ADAPTIVE_STEP = int(os.environ.get("QTMERGE_ADAPTIVE_STEP", "100"))
-ADAPTIVE_MARGIN = float(os.environ.get("QTMERGE_ADAPTIVE_MARGIN", "0.10"))
+ADAPTIVE_MARGIN = float(os.environ.get("QTMERGE_ADAPTIVE_MARGIN", "0.20"))
 ADAPTIVE_ALPHA = float(os.environ.get("QTMERGE_ADAPTIVE_ALPHA", "0.01"))
+ADAPTIVE_EXACT_ON_UNRELIABLE = os.environ.get("QTMERGE_ADAPTIVE_EXACT_ON_UNRELIABLE", "0") == "1"
+GHOST_RESCUE = os.environ.get("QTMERGE_GHOST_RESCUE", "off")
+GHOST_RESCUE_MARGIN = float(os.environ.get("QTMERGE_GHOST_RESCUE_MARGIN", "0.03"))
 _COUNT_CACHE = OrderedDict()
 _COUNT_CACHE_SOURCE_ID = None
 PROFILE = False
@@ -46,6 +49,7 @@ _PROFILE_TIMINGS = {}
 _PROFILE_STACK = []
 _PROFILE_COUNTS = {}
 _PLACEMENT_DEPTH = 0
+_FORCE_EXACT_COUNT_DEPTH = 0
 
 
 def _profile_enter(name):
@@ -605,6 +609,8 @@ def _add_topos_for_tree(pt, label_assignments, num_quartets):
                     nq[2] += a[0]*b[3]*out1*out2 + a[1]*a[2]*b[0]*out3 + a[1]*a[2]*b[3]*out0
 
 def _adaptive_quartets_enabled():
+    if _FORCE_EXACT_COUNT_DEPTH > 0:
+        return False
     return ADAPTIVE_QUARTETS == "all" or (
         ADAPTIVE_QUARTETS == "placement" and _PLACEMENT_DEPTH > 0
     )
@@ -702,6 +708,24 @@ def count_all_topos(preprocessed_trees, taxa_list):
             _COUNT_CACHE.popitem(last=False)
     return num_quartets
 
+
+def count_all_topos_exact(preprocessed_trees, taxa_list, context):
+    global _FORCE_EXACT_COUNT_DEPTH
+    _profile_count(f"adaptive_exact_fallback_{context}")
+    _FORCE_EXACT_COUNT_DEPTH += 1
+    try:
+        return count_all_topos(preprocessed_trees, taxa_list)
+    finally:
+        _FORCE_EXACT_COUNT_DEPTH -= 1
+
+
+def maybe_exact_on_unreliable(preprocessed_trees, taxa_list, counts, pvalue, context):
+    if (ADAPTIVE_EXACT_ON_UNRELIABLE and ADAPTIVE_QUARTETS != "off" and
+        pvalue < ALPHA_QUARTET):
+        counts = count_all_topos_exact(preprocessed_trees, taxa_list, context)
+        pvalue = test_p1_equivalence(counts)
+    return counts, pvalue
+
 def is_quartet_reliable(counts,
                         epsilon=EPSILON_ANOMALY,
                         alpha=ALPHA_QUARTET,
@@ -734,6 +758,31 @@ def dominant_topology(counts):
     if counts[0] >= counts[1] and counts[0] >= counts[2]:
         return 0
     if counts[1] >= counts[0] and counts[1] >= counts[2]:
+        return 1
+    return 2
+
+
+def dominant_margin(counts):
+    total = sum(counts)
+    if total <= 0:
+        return 0.0
+    ordered = sorted(counts, reverse=True)
+    return (ordered[0] - ordered[1]) / total
+
+
+def ghost_rescue_allowed(counts, context):
+    if GHOST_RESCUE == "off":
+        return False
+    if dominant_margin(counts) < GHOST_RESCUE_MARGIN:
+        return False
+    _profile_count(f"ghost_rescued_{context}")
+    return True
+
+
+def merge_assignment_from_counts(counts):
+    if counts[2] >= counts[1] and counts[2] >= counts[0]:
+        return 0
+    if counts[1] >= counts[2] and counts[1] >= counts[0]:
         return 1
     return 2
 
@@ -1014,7 +1063,7 @@ def find_taxon_placement(t, tree, num_leaves, genetrees, test=False, leaf_labels
 
 
 
-def find_taxon_placement_new(t, tree, num_leaves, genetrees, test=False, leaf_labels=None):
+def find_taxon_placement_new(t, tree, num_leaves, genetrees, test=False, leaf_labels=None, rescue_ambiguous=False):
 	node = find_middle_branch(tree, num_leaves)
 	if leaf_labels is None:
 		leaf_labels = compute_leaf_labels(tree)
@@ -1055,6 +1104,12 @@ def find_taxon_placement_new(t, tree, num_leaves, genetrees, test=False, leaf_la
 		if test:
 			pval = test_p1_equivalence(q)
 			if pval < ALPHA_QUARTET:
+				q, pval = maybe_exact_on_unreliable(
+					genetrees, taxa, q, pval, "placement"
+				)
+			if pval < ALPHA_QUARTET and not (
+				rescue_ambiguous and ghost_rescue_allowed(q, "placement")
+			):
 				return None, pval
 		vprint(taxa, q, pval)
 
@@ -1226,7 +1281,8 @@ def merge_trees(genetrees, tree1, tree2, placements, ghosts):
         for l in tree2.traverse_leaves():
             place, pval = find_taxon_placement_new(l.label, tree1, tree1_num_leaves,
                                          genetrees, test=True,
-                                         leaf_labels=tree1_leaf_labels)
+                                         leaf_labels=tree1_leaf_labels,
+                                         rescue_ambiguous=True)
             if place is None:
                 vprint([l.label, pval])
                 _profile_count("ghost_created_merge_base")
@@ -1280,19 +1336,21 @@ def merge_trees(genetrees, tree1, tree2, placements, ghosts):
             taxon = to_check.pop(0)
             q = count_all_topos(genetrees, taxa + [[taxon]])
             p_val = test_p1_equivalence(q)
+            if p_val < ALPHA_QUARTET:
+                q, p_val = maybe_exact_on_unreliable(
+                    genetrees, taxa + [[taxon]], q, p_val, "merge_assignment"
+                )
             vprint(taxa + [[taxon]], q, p_val < ALPHA_QUARTET)
             if p_val < ALPHA_QUARTET:
+                if ghost_rescue_allowed(q, "merge_assignment"):
+                    assignments[-1] = merge_assignment_from_counts(q)
+                    break
                 p_values[taxon] = p_val
                 continue
             # if p_val < ALPHA_QUARTET:
             # 	p_values.append(p_val)
             # 	assignments.append(-1)
-            elif q[2] >= q[1] and q[2] >= q[0]:
-                assignments[-1] = 0
-            elif q[1] >= q[2] and q[1] >= q[0]:
-                assignments[-1] = 1
-            else:
-                assignments[-1] = 2
+            assignments[-1] = merge_assignment_from_counts(q)
             break
 
     vprint(assignments)
@@ -1495,6 +1553,14 @@ def create_full_tree(rev_placements, tree1, tree2, genetrees, index):
             # is_quartet_reliable returns True — gate is a no-op.
             pval = test_p1_equivalence(q)
             if pval < ALPHA_QUARTET:
+                q, pval = maybe_exact_on_unreliable(
+                    genetrees,
+                    [[i] for i in rev_placements[p]] + [leaf_up, leaf_down],
+                    q,
+                    pval,
+                    "create_full_pair",
+                )
+            if pval < ALPHA_QUARTET and not ghost_rescue_allowed(q, "create_full_pair"):
                 _profile_count("ghost_created_create_full_pair", len(rev_placements[p]))
                 ghosts_collected.extend([[p, pval] for p in rev_placements[p]])
                 continue
@@ -1582,6 +1648,14 @@ def create_full_tree(rev_placements, tree1, tree2, genetrees, index):
                 # are decisive and is_quartet_reliable is True.
                 pval = test_p1_equivalence(q)
                 if pval < ALPHA_QUARTET:
+                    q, pval = maybe_exact_on_unreliable(
+                        genetrees,
+                        [leaf_up, leaf_down, taxa1, taxa2],
+                        q,
+                        pval,
+                        "create_full_multi",
+                    )
+                if pval < ALPHA_QUARTET and not ghost_rescue_allowed(q, "create_full_multi"):
                     _profile_count("ghost_created_create_full_multi", len(rev_placements[p]))
                     ghosts_collected.extend([[p, pval] for p in rev_placements[p]])
                     continue
@@ -1661,11 +1735,19 @@ def infer_tree(leaves, genetrees, index, ghosts=None):
 
     if n == 4:
         q = count_all_topos(genetrees, [[l] for l in leaves])
+        if not is_quartet_reliable(q):
+            q, _ = maybe_exact_on_unreliable(
+                genetrees,
+                [[l] for l in leaves],
+                q,
+                test_p1_equivalence(q),
+                "infer_quartet",
+            )
 
         # NEW: if the quartet is uninformative, defer one leaf as a ghost
         # and return a 3-leaf star. The deferred leaf will be re-placed at
         # the end with the full backbone available.
-        if not is_quartet_reliable(q):
+        if not is_quartet_reliable(q) and not ghost_rescue_allowed(q, "infer_quartet"):
             # Pick the leaf whose removal leaves the most "balanced" triple.
             # Cheap heuristic: ghost the last leaf. (You can replace this
             # with a smarter rule, e.g. the leaf appearing in the fewest
@@ -1765,7 +1847,10 @@ def main():
 	global ADAPTIVE_STEP
 	global ADAPTIVE_MARGIN
 	global ADAPTIVE_ALPHA
+	global ADAPTIVE_EXACT_ON_UNRELIABLE
 	global COUNTER_MODE
+	global GHOST_RESCUE
+	global GHOST_RESCUE_MARGIN
 	parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 	parser.add_argument('-t', '--trees', required=True, help="Input Trees")
 	parser.add_argument('-s', '--seed', required=False, default=1142, help="Random Seed")
@@ -1792,6 +1877,12 @@ def main():
 	                    help="Minimum dominant-vs-runner-up count margin fraction for adaptive early-stopping")
 	parser.add_argument('--adaptive_alpha', type=float, default=ADAPTIVE_ALPHA,
 	                    help="Minimum conservative p-value for adaptive early-stopping")
+	parser.add_argument('--adaptive_exact_on_unreliable', action="store_true", default=ADAPTIVE_EXACT_ON_UNRELIABLE,
+	                    help="In adaptive modes, rerun unreliable ghost-producing quartet decisions with exact counting")
+	parser.add_argument('--ghost_rescue', choices=["off", "margin"], default=GHOST_RESCUE,
+	                    help="Avoid ghosting unresolved taxa when the dominant quartet topology still has enough margin")
+	parser.add_argument('--ghost_rescue_margin', type=float, default=GHOST_RESCUE_MARGIN,
+	                    help="Dominant-vs-runner-up count margin fraction required for --ghost_rescue margin")
 	parser.add_argument('--prune', action="store_true",
 	                    help="Use pruned ASTRAL: iteratively remove the smallest "
 	                         "quadripartition of unreliable branches (1-exp(-l)<0.05) "
@@ -1815,6 +1906,9 @@ def main():
 	ADAPTIVE_STEP = args.adaptive_step
 	ADAPTIVE_MARGIN = args.adaptive_margin
 	ADAPTIVE_ALPHA = args.adaptive_alpha
+	ADAPTIVE_EXACT_ON_UNRELIABLE = args.adaptive_exact_on_unreliable
+	GHOST_RESCUE = args.ghost_rescue
+	GHOST_RESCUE_MARGIN = args.ghost_rescue_margin
 
 	random.seed(a=int(args.seed))
 	np.random.seed(int(args.seed))
@@ -1938,7 +2032,14 @@ def main():
 			taxa = l[0]
 			pval = l[1]
 			vprint(taxa, pval)
-			node, pval = find_taxon_placement_new(taxa, inferred_tree, num_leaves, preprocessed, test = True)
+			node, pval = find_taxon_placement_new(
+				taxa,
+				inferred_tree,
+				num_leaves,
+				preprocessed,
+				test=True,
+				rescue_ambiguous=True,
+			)
 			if not node:
 				_profile_count("ghost_reliable_retries")
 				ghosts.append([taxa,pval])

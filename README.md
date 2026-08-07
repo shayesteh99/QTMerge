@@ -45,9 +45,16 @@ when available, or `--counter validate` to compare both counters during a run.
 Use `--adaptive_quartets placement` to enable conservative adaptive quartet
 counting during placement, or `--adaptive_quartets all` to apply the same
 early-stop rule to merge decisions too. The `all` mode can be much faster, but
-should be benchmarked for accuracy before production use. Tune with
+should be benchmarked for accuracy before production use. The default adaptive
+margin is conservative (`--adaptive_margin 0.20`). Tune with
 `--adaptive_min_trees`, `--adaptive_step`, `--adaptive_margin`, and
 `--adaptive_alpha`.
+
+Two experimental ghost safeguards are also available:
+`--adaptive_exact_on_unreliable` reruns unreliable adaptive decisions with exact
+counting before ghosting, and `--ghost_rescue margin` allows low-confidence
+ghost-producing decisions to proceed when the dominant topology has enough
+margin.
 
 ## How to run
 You can run QTMerge on a set of gene trees using the command below:
