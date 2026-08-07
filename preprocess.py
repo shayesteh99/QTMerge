@@ -28,6 +28,9 @@ class PreprocessedTree:
     __slots__ = (
         "tree", "tin", "tout", "depth",
         "label_to_node", "_euler", "_first", "_st", "_log",
+        "node_to_id", "label_to_id", "_flat_tin", "_flat_tout",
+        "_flat_depth", "_flat_first", "_flat_euler", "_flat_st",
+        "_flat_log",
     )
 
     def __init__(self, tree):
@@ -40,6 +43,7 @@ class PreprocessedTree:
         self._first = {}         # node -> first index in Euler tour
         self._build_euler_tour()
         self._build_sparse_table()
+        self._build_flat_arrays()
 
     # --- build ------------------------------------------------------------
 
@@ -98,6 +102,26 @@ class PreprocessedTree:
                 cur[i] = a if depth[euler[a]] < depth[euler[b]] else b
             st[k] = cur
         self._st = st
+
+    def _build_flat_arrays(self):
+        nodes = sorted(self.tin, key=self.tin.__getitem__)
+        self.node_to_id = {node: i for i, node in enumerate(nodes)}
+        n = len(nodes)
+        self.label_to_id = {}
+        self._flat_tin = [0] * n
+        self._flat_tout = [0] * n
+        self._flat_depth = [0] * n
+        self._flat_first = [0] * n
+        for node, i in self.node_to_id.items():
+            self._flat_tin[i] = self.tin[node]
+            self._flat_tout[i] = self.tout[node]
+            self._flat_depth[i] = self.depth[node]
+            self._flat_first[i] = self._first[node]
+            if node.is_leaf():
+                self.label_to_id[node.label] = i
+        self._flat_euler = [self.node_to_id[node] for node in self._euler]
+        self._flat_st = self._st
+        self._flat_log = self._log
 
     # --- query ------------------------------------------------------------
 

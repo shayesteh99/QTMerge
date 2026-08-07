@@ -2,18 +2,25 @@ import sys
 import os
 os.environ["PYTHONHASHSEED"] = "0"
 import argparse
+from collections import OrderedDict
+import math
 import time
 import numpy as np
 from treeswift import *
 import treeswift
 import random
 import warnings
-from statsmodels.stats.proportion import proportions_ztest
 warnings.filterwarnings("ignore")
+import shutil
 import subprocess
 import tempfile
 
 from preprocess import PreprocessedTree
+
+try:
+	import qtmerge_fast
+except ImportError:
+	qtmerge_fast = None
 
 ALPHA_QUARTET = 0.05         # significance level
 EPSILON_ANOMALY = 0.05       # required margin above 1/3 for the dominant topo
@@ -22,6 +29,82 @@ MIN_QUARTETS_FOR_TEST = 1    # only guard against zero-data quartets; the
                              # (decisive counts like (k,0,0) yield p_val ~= 1
                              # so they're flagged reliable even when k is tiny,
                              # which is what we want for low-discord input)
+ASTRAL_CMD = os.environ.get("ASTRAL4_CMD", "astral4")
+ASTRAL_SEED = os.environ.get("ASTRAL4_SEED")
+ASTRAL_THREADS = int(os.environ.get("ASTRAL4_THREADS", "1"))
+COUNT_CACHE_MAXSIZE = int(os.environ.get("QTMERGE_COUNT_CACHE_SIZE", "0"))
+ADAPTIVE_QUARTETS = "off"
+COUNTER_MODE = os.environ.get("QTMERGE_COUNTER", "python")
+ADAPTIVE_MIN_TREES = int(os.environ.get("QTMERGE_ADAPTIVE_MIN_TREES", "500"))
+ADAPTIVE_STEP = int(os.environ.get("QTMERGE_ADAPTIVE_STEP", "100"))
+ADAPTIVE_MARGIN = float(os.environ.get("QTMERGE_ADAPTIVE_MARGIN", "0.10"))
+ADAPTIVE_ALPHA = float(os.environ.get("QTMERGE_ADAPTIVE_ALPHA", "0.01"))
+_COUNT_CACHE = OrderedDict()
+_COUNT_CACHE_SOURCE_ID = None
+PROFILE = False
+_PROFILE_TIMINGS = {}
+_PROFILE_STACK = []
+_PROFILE_COUNTS = {}
+_PLACEMENT_DEPTH = 0
+
+
+def _profile_enter(name):
+	if not PROFILE:
+		return None
+	entry = [name, time.perf_counter(), 0.0]
+	_PROFILE_STACK.append(entry)
+	return entry
+
+
+def _profile_exit(name, entry):
+	if entry is None:
+		return
+	elapsed = time.perf_counter() - entry[1]
+	self_time = elapsed - entry[2]
+	if _PROFILE_STACK and _PROFILE_STACK[-1] is entry:
+		_PROFILE_STACK.pop()
+	elif entry in _PROFILE_STACK:
+		_PROFILE_STACK.remove(entry)
+	if _PROFILE_STACK:
+		_PROFILE_STACK[-1][2] += elapsed
+	calls, inclusive, self_total = _PROFILE_TIMINGS.get(name, (0, 0.0, 0.0))
+	_PROFILE_TIMINGS[name] = (calls + 1, inclusive + elapsed, self_total + self_time)
+
+
+def _profile_count(name, increment=1):
+	if not PROFILE:
+		return
+	_PROFILE_COUNTS[name] = _PROFILE_COUNTS.get(name, 0) + increment
+
+
+def _print_profile(total_runtime):
+	if not PROFILE:
+		return
+	print("QTMerge profile:", file=sys.stderr)
+	print(f"{'step':32s} {'calls':>10s} {'inclusive':>12s} {'self':>12s} {'self_pct':>9s}", file=sys.stderr)
+	for name, (calls, inclusive, self_total) in sorted(_PROFILE_TIMINGS.items(), key=lambda item: item[1][2], reverse=True):
+		pct = 100.0 * self_total / total_runtime if total_runtime > 0 else 0.0
+		print(f"{name:32s} {calls:10d} {inclusive:12.3f} {self_total:12.3f} {pct:8.1f}%", file=sys.stderr)
+	if _PROFILE_COUNTS:
+		print("\nQTMerge counters:", file=sys.stderr)
+		print(f"{'counter':40s} {'count':>12s}", file=sys.stderr)
+		for name, count in sorted(_PROFILE_COUNTS.items()):
+			print(f"{name:40s} {count:12d}", file=sys.stderr)
+
+
+def _profiled(name, func):
+	def wrapper(*args, **kwargs):
+		global _PLACEMENT_DEPTH
+		start = _profile_enter(name)
+		if name == "find_taxon_placement_new":
+			_PLACEMENT_DEPTH += 1
+		try:
+			return func(*args, **kwargs)
+		finally:
+			if name == "find_taxon_placement_new":
+				_PLACEMENT_DEPTH -= 1
+			_profile_exit(name, start)
+	return wrapper
 
 
 def vprint(*x, **kwargs):
@@ -52,6 +135,32 @@ def __label_tree__(tree_obj, index = 0):
 def preprocess_trees(trees):
     """Preprocess a list of trees once; pass the result to count_all_topos."""
     return [PreprocessedTree(t) for t in trees]
+
+def _normal_cdf(x):
+	return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def _proportions_ztest_smaller(count, nobs, value):
+	"""One-sample proportions z-test p-value for alternative='smaller'."""
+	if nobs <= 0:
+		return 0.0
+	proportion = count / nobs
+	variance = proportion * (1.0 - proportion) / nobs
+	if variance <= 0.0:
+		return 1.0 if proportion >= value else 0.0
+	z_stat = (proportion - value) / math.sqrt(variance)
+	return _normal_cdf(z_stat)
+
+def _require_executable(command, purpose, hint=None):
+	executable = command[0] if isinstance(command, (list, tuple)) else command
+	if os.path.dirname(executable):
+		found = os.path.isfile(executable) and os.access(executable, os.X_OK)
+	else:
+		found = shutil.which(executable) is not None
+	if not found:
+		message = f"{purpose} executable '{executable}' was not found. Install it."
+		if hint:
+			message += f" {hint}"
+		raise RuntimeError(message)
 
 def _induced_subtree(pt, leaves):
     """
@@ -126,6 +235,11 @@ def copy_subtree(node):
             copy_n.add_child(c_copy)
             stack.append((c, c_copy))
     return root_copy
+
+def copy_tree(tree):
+    new_tree = Tree()
+    new_tree.root = copy_subtree(tree.root)
+    return new_tree
 
 def fast_extract(tree2_pt, labels):
     """Build induced subtree for `labels` in O(K log K) using PreprocessedTree."""
@@ -262,27 +376,46 @@ def get_astral_tree_pruned(trees, taxa, index, min_taxa=4):
     return tree, index, list(all_ghosts)
 
 
+def _extract_tree_for_astral(tree_or_pt, taxa):
+	if isinstance(tree_or_pt, PreprocessedTree):
+		return fast_extract(tree_or_pt, taxa)
+	return tree_or_pt.extract_tree_with(taxa)
+
+
 def get_astral_tree(trees, taxa, index = 0):
 	# print(*taxa, sep = " ")
+	_require_executable(
+		ASTRAL_CMD,
+		"ASTRAL",
+		"Set ASTRAL4_CMD or pass --astral_cmd with the executable path.",
+	)
+	_prof = _profile_enter("astral_prepare_input")
 	f = tempfile.NamedTemporaryFile(mode="w+", delete=False)
 	for t in trees:
-		pruned = t.extract_tree_with(taxa)
+		pruned = _extract_tree_for_astral(t, taxa)
 		f.write(pruned.newick() + "\n")
 	f.flush()
 	f.close()
+	_profile_exit("astral_prepare_input", _prof)
 
+	_prof = _profile_enter("astral_subprocess")
 	proc = subprocess.run([
-		"astral4",
+		ASTRAL_CMD,
 		"-i", f.name, 
 		"--length", "CULength",
+		"--seed", str(ASTRAL_SEED),
+		"--thread", str(ASTRAL_THREADS),
 	], capture_output=True,
 	text=True,
 	check=True)
+	_profile_exit("astral_subprocess", _prof)
 	# print(proc.stdout)
 
+	_prof = _profile_enter("astral_parse_output")
 	tree = proc.stdout.split("\n")[0]
 	# print(tree)
 	tree_obj = read_tree_newick(tree)
+	_profile_exit("astral_parse_output", _prof)
 	# _, index = __label_tree__(tree_obj, index)
 	return tree_obj, index, []
 	# print(tree)
@@ -343,6 +476,7 @@ def get_astral_tree(trees, taxa, index = 0):
 
 
 def get_subtree(start_tree, taxa, index):
+	_require_executable("nw_prune", "Newick Utilities")
 	cmd = ["nw_prune", "-v", start_tree] + [str(t) for t in taxa]
 
 	proc = subprocess.run(
@@ -391,6 +525,98 @@ def extract_quartet(trees, taxa):
 	return [p[0], p[1]], [l for l in taxa if l not in p]
 	# return parents[p], [l for l in taxa if l not in parents[p]]
 
+def _add_topos_for_tree(pt, label_assignments, num_quartets):
+    ltn = pt.label_to_node
+    # Build node→set-index map and target_leaves in one pass using node
+    # identity (faster hash than string labels).
+    node_to_set = {}
+    target_leaves = []
+    for label, i in label_assignments:
+        node = ltn.get(label)
+        if node is not None:
+            existing = node_to_set.get(node)
+            if existing is None:
+                node_to_set[node] = i
+                target_leaves.append(node)
+            # if already in node_to_set, label appears in multiple sets;
+            # keep first assignment (groups are disjoint in normal use)
+
+    if len(target_leaves) < 4:
+        return  # no quartet possible
+
+    # 2. induced subtree (size O(n))
+    preorder, children, root = _induced_subtree(pt, target_leaves)
+
+    # 3. postorder accumulation of per-set leaf counts
+    num_taxa = {n: [0, 0, 0, 0] for n in preorder}
+    for n in reversed(preorder):
+        kids = children[n]
+        if not kids:
+            si = node_to_set.get(n)
+            if si is not None:
+                num_taxa[n][si] = 1
+            continue
+        counts = num_taxa[n]
+        for c in kids:
+            cc = num_taxa[c]
+            counts[0] += cc[0]
+            counts[1] += cc[1]
+            counts[2] += cc[2]
+            counts[3] += cc[3]
+
+    root_counts = num_taxa[root]
+
+    # 4. main pass — unrolled for the common binary-node case
+    nq = num_quartets
+    for n in preorder:
+        kids = children[n]
+        if not kids:
+            continue
+        n_counts = num_taxa[n]
+        out0 = root_counts[0] - n_counts[0]
+        out1 = root_counts[1] - n_counts[1]
+        out2 = root_counts[2] - n_counts[2]
+        out3 = root_counts[3] - n_counts[3]
+
+        if len(kids) == 2:
+            # Unrolled binary case: both (a,b) and (b,a) pairs in one block
+            a = num_taxa[kids[0]]
+            b = num_taxa[kids[1]]
+            a0,a1,a2,a3 = a[0],a[1],a[2],a[3]
+            b0,b1,b2,b3 = b[0],b[1],b[2],b[3]
+            nq[0] += (a0*b1 + b0*a1)*out2*out3
+            nq[0] += (a2*a3*b0 + b2*b3*a0)*out1
+            nq[0] += (a2*a3*b1 + b2*b3*a1)*out0
+            nq[1] += (a0*b2 + b0*a2)*out1*out3
+            nq[1] += (a1*a3*b0 + b1*b3*a0)*out2
+            nq[1] += (a1*a3*b2 + b1*b3*a2)*out0
+            nq[2] += (a0*b3 + b0*a3)*out1*out2
+            nq[2] += (a1*a2*b0 + b1*b2*a0)*out3
+            nq[2] += (a1*a2*b3 + b1*b2*a3)*out0
+        else:
+            for c1 in kids:
+                a = num_taxa[c1]
+                for c2 in kids:
+                    if c1 is c2:
+                        continue
+                    b = num_taxa[c2]
+                    nq[0] += a[0]*b[1]*out2*out3 + a[2]*a[3]*b[0]*out1 + a[2]*a[3]*b[1]*out0
+                    nq[1] += a[0]*b[2]*out1*out3 + a[1]*a[3]*b[0]*out2 + a[1]*a[3]*b[2]*out0
+                    nq[2] += a[0]*b[3]*out1*out2 + a[1]*a[2]*b[0]*out3 + a[1]*a[2]*b[3]*out0
+
+def _adaptive_quartets_enabled():
+    return ADAPTIVE_QUARTETS == "all" or (
+        ADAPTIVE_QUARTETS == "placement" and _PLACEMENT_DEPTH > 0
+    )
+
+def _adaptive_counts_decisive(counts):
+    total = sum(counts)
+    if total <= 0:
+        return False
+    sorted_counts = sorted(counts, reverse=True)
+    margin = (sorted_counts[0] - sorted_counts[1]) / total
+    return margin >= ADAPTIVE_MARGIN and test_p1_equivalence(counts) >= ADAPTIVE_ALPHA
+
 def count_all_topos(preprocessed_trees, taxa_list):
     """
     preprocessed_trees: list returned by preprocess_trees(...)
@@ -401,89 +627,79 @@ def count_all_topos(preprocessed_trees, taxa_list):
     if len(taxa_list) != 4:
         print("not enough taxa!!")
         return
+    if _PLACEMENT_DEPTH > 0:
+        _profile_count("count_all_topos_inside_placement")
+    else:
+        _profile_count("count_all_topos_outside_placement")
+
+    global _COUNT_CACHE_SOURCE_ID
+    source_id = id(preprocessed_trees)
+    if _COUNT_CACHE_SOURCE_ID is not None and _COUNT_CACHE_SOURCE_ID != source_id:
+        _COUNT_CACHE.clear()
+    _COUNT_CACHE_SOURCE_ID = source_id
+
+    cache_key = (
+        source_id,
+        tuple(tuple(group) for group in taxa_list),
+    )
+    if COUNT_CACHE_MAXSIZE > 0:
+        cached = _COUNT_CACHE.get(cache_key)
+        if cached is not None:
+            _profile_count("count_all_topos_cache_hit")
+            _COUNT_CACHE.move_to_end(cache_key)
+            return list(cached)
+        _profile_count("count_all_topos_cache_miss")
 
     num_quartets = [0, 0, 0]
+    label_assignments = [
+        (label, i)
+        for i, group in enumerate(taxa_list)
+        for label in group
+    ]
 
-    for pt in preprocessed_trees:
-        ltn = pt.label_to_node
-        # Build node→set-index map and target_leaves in one pass using node
-        # identity (faster hash than string labels).
-        node_to_set = {}
-        target_leaves = []
-        for i, group in enumerate(taxa_list):
-            for label in group:
-                node = ltn.get(label)
-                if node is not None:
-                    existing = node_to_set.get(node)
-                    if existing is None:
-                        node_to_set[node] = i
-                        target_leaves.append(node)
-                    # if already in node_to_set, label appears in multiple sets;
-                    # keep first assignment (groups are disjoint in normal use)
+    adaptive = _adaptive_quartets_enabled()
+    min_trees = max(1, min(ADAPTIVE_MIN_TREES, len(preprocessed_trees)))
+    step = max(1, ADAPTIVE_STEP)
 
-        if len(target_leaves) < 4:
-            continue  # no quartet possible
+    use_fast_counter = qtmerge_fast is not None and COUNTER_MODE in ("auto", "fast", "validate")
+    if use_fast_counter:
+        fast_counts, trees_used = qtmerge_fast.count_all_topos_fast(
+            preprocessed_trees,
+            taxa_list,
+            adaptive,
+            min_trees,
+            step,
+            ADAPTIVE_MARGIN,
+            ADAPTIVE_ALPHA,
+            EPSILON_ANOMALY,
+        )
+        if trees_used < len(preprocessed_trees):
+            _profile_count("adaptive_quartets_early_stop")
+            _profile_count("adaptive_quartets_trees_skipped", len(preprocessed_trees) - trees_used)
+        if COUNTER_MODE != "validate":
+            num_quartets = fast_counts
+            if COUNT_CACHE_MAXSIZE > 0:
+                _COUNT_CACHE[cache_key] = tuple(num_quartets)
+                if len(_COUNT_CACHE) > COUNT_CACHE_MAXSIZE:
+                    _COUNT_CACHE.popitem(last=False)
+            return num_quartets
 
-        # 2. induced subtree (size O(n))
-        preorder, children, root = _induced_subtree(pt, target_leaves)
+    for tree_index, pt in enumerate(preprocessed_trees, start=1):
+        _add_topos_for_tree(pt, label_assignments, num_quartets)
+        if (adaptive and tree_index >= min_trees and
+            (tree_index == len(preprocessed_trees) or tree_index % step == 0) and
+            _adaptive_counts_decisive(num_quartets)):
+            _profile_count("adaptive_quartets_early_stop")
+            _profile_count("adaptive_quartets_trees_skipped", len(preprocessed_trees) - tree_index)
+            break
 
-        # 3. postorder accumulation of per-set leaf counts
-        num_taxa = {n: [0, 0, 0, 0] for n in preorder}
-        for n in reversed(preorder):
-            kids = children[n]
-            if not kids:
-                si = node_to_set.get(n)
-                if si is not None:
-                    num_taxa[n][si] = 1
-                continue
-            counts = num_taxa[n]
-            for c in kids:
-                cc = num_taxa[c]
-                counts[0] += cc[0]
-                counts[1] += cc[1]
-                counts[2] += cc[2]
-                counts[3] += cc[3]
+    if COUNTER_MODE == "validate" and use_fast_counter and list(fast_counts) != num_quartets:
+        raise RuntimeError(f"fast counter mismatch: fast={fast_counts} python={num_quartets}")
 
-        root_counts = num_taxa[root]
-
-        # 4. main pass — unrolled for the common binary-node case
-        nq = num_quartets
-        for n in preorder:
-            kids = children[n]
-            if not kids:
-                continue
-            n_counts = num_taxa[n]
-            out0 = root_counts[0] - n_counts[0]
-            out1 = root_counts[1] - n_counts[1]
-            out2 = root_counts[2] - n_counts[2]
-            out3 = root_counts[3] - n_counts[3]
-
-            if len(kids) == 2:
-                # Unrolled binary case: both (a,b) and (b,a) pairs in one block
-                a = num_taxa[kids[0]]
-                b = num_taxa[kids[1]]
-                a0,a1,a2,a3 = a[0],a[1],a[2],a[3]
-                b0,b1,b2,b3 = b[0],b[1],b[2],b[3]
-                nq[0] += (a0*b1 + b0*a1)*out2*out3
-                nq[0] += (a2*a3*b0 + b2*b3*a0)*out1
-                nq[0] += (a2*a3*b1 + b2*b3*a1)*out0
-                nq[1] += (a0*b2 + b0*a2)*out1*out3
-                nq[1] += (a1*a3*b0 + b1*b3*a0)*out2
-                nq[1] += (a1*a3*b2 + b1*b3*a2)*out0
-                nq[2] += (a0*b3 + b0*a3)*out1*out2
-                nq[2] += (a1*a2*b0 + b1*b2*a0)*out3
-                nq[2] += (a1*a2*b3 + b1*b2*a3)*out0
-            else:
-                for c1 in kids:
-                    a = num_taxa[c1]
-                    for c2 in kids:
-                        if c1 is c2:
-                            continue
-                        b = num_taxa[c2]
-                        nq[0] += a[0]*b[1]*out2*out3 + a[2]*a[3]*b[0]*out1 + a[2]*a[3]*b[1]*out0
-                        nq[1] += a[0]*b[2]*out1*out3 + a[1]*a[3]*b[0]*out2 + a[1]*a[3]*b[2]*out0
-                        nq[2] += a[0]*b[3]*out1*out2 + a[1]*a[2]*b[0]*out3 + a[1]*a[2]*b[3]*out0
-
+    if COUNT_CACHE_MAXSIZE > 0:
+        _COUNT_CACHE[cache_key] = tuple(num_quartets)
+        if len(_COUNT_CACHE) > COUNT_CACHE_MAXSIZE:
+            _COUNT_CACHE.popitem(last=False)
     return num_quartets
 
 def is_quartet_reliable(counts,
@@ -543,8 +759,7 @@ def test_p1_equivalence(counts, epsilon=EPSILON_ANOMALY):
 		x1 = counts[1]
 	else:
 		x1 = counts[2]
-	z_stat, p_val = proportions_ztest(count=x1, nobs=k, value=1/3+epsilon, alternative='smaller')
-	return p_val
+	return _proportions_ztest_smaller(count=x1, nobs=k, value=1/3+epsilon)
 
 
 def compute_num_leaves(tree):
@@ -803,11 +1018,14 @@ def find_taxon_placement_new(t, tree, num_leaves, genetrees, test=False, leaf_la
 	node = find_middle_branch(tree, num_leaves)
 	if leaf_labels is None:
 		leaf_labels = compute_leaf_labels(tree)
+	root_leaf_labels = leaf_labels[tree.root]
+	leaf_label_sets = {n: set(labels) for n, labels in leaf_labels.items()}
 	visited = set()
 	prev = None
 	while True:
+		_profile_count("placement_walk_steps")
 		visited.add(node)
-		print(node.label)
+		vprint(node.label)
 		nc = node.children
 		if len(nc) == 1 and nc[0] in visited:
 			node = node.parent
@@ -825,7 +1043,8 @@ def find_taxon_placement_new(t, tree, num_leaves, genetrees, test=False, leaf_la
 		# for c in parent.children:
 		# 	if c != node:
 		# 		taxa.append(leaf_labels[c])
-		taxa.append([l for l in leaf_labels[tree.root] if l not in leaf_labels[node]])
+		node_leaf_set = leaf_label_sets[node]
+		taxa.append([l for l in root_leaf_labels if l not in node_leaf_set])
 
 		taxa.append([t])
 		# q = extract_quartet(genetrees, taxa+[t])
@@ -837,7 +1056,7 @@ def find_taxon_placement_new(t, tree, num_leaves, genetrees, test=False, leaf_la
 			pval = test_p1_equivalence(q)
 			if pval < ALPHA_QUARTET:
 				return None, pval
-		print(taxa, q, pval)
+		vprint(taxa, q, pval)
 
 		if q[2] > q[1] and q[2] > q[0]:
 		# if [taxa[0],t] in q or [t,taxa[0]] in q:
@@ -1010,6 +1229,7 @@ def merge_trees(genetrees, tree1, tree2, placements, ghosts):
                                          leaf_labels=tree1_leaf_labels)
             if place is None:
                 vprint([l.label, pval])
+                _profile_count("ghost_created_merge_base")
                 ghosts.append([l.label, pval])
                 continue
             if place.edge_length == 0:
@@ -1093,10 +1313,11 @@ def merge_trees(genetrees, tree1, tree2, placements, ghosts):
     if len(counts) == 1 and len(tree2_taxa) >= 2:
         only = next(iter(counts))
         if only == -1:
-        	for i in range(4):
-        		for t in tree2_taxa[i]:
-        			ghosts.append([t, p_values[t]])
-        	return
+            for i in range(4):
+                for t in tree2_taxa[i]:
+                    _profile_count("ghost_created_merge_all_unassigned")
+                    ghosts.append([t, p_values[t]])
+            return
 
         out = [t for i, group in enumerate(taxa) if i != only for t in group]
         which = [1] * len(tree2_taxa)
@@ -1136,6 +1357,7 @@ def merge_trees(genetrees, tree1, tree2, placements, ghosts):
         for i in counts[-1]:
             # print(i, " added to ghosts")
             for t in tree2_taxa[i]:
+                _profile_count("ghost_created_merge_unassigned_group")
                 ghosts.append([t, p_values[t]])
 
         if len(counts[-1]) == 1:
@@ -1229,7 +1451,7 @@ def merge_trees(genetrees, tree1, tree2, placements, ghosts):
 
 
 def create_full_tree(rev_placements, tree1, tree2, genetrees, index):
-    full_tree = read_tree_newick(tree1.newick())
+    full_tree = copy_tree(tree1)
     # We'll need to expose ghosts; the original signature doesn't return them,
     # so collect them onto a closure list and have the caller drain it.
     ghosts_collected = []
@@ -1273,6 +1495,7 @@ def create_full_tree(rev_placements, tree1, tree2, genetrees, index):
             # is_quartet_reliable returns True — gate is a no-op.
             pval = test_p1_equivalence(q)
             if pval < ALPHA_QUARTET:
+                _profile_count("ghost_created_create_full_pair", len(rev_placements[p]))
                 ghosts_collected.extend([[p, pval] for p in rev_placements[p]])
                 continue
 
@@ -1359,6 +1582,7 @@ def create_full_tree(rev_placements, tree1, tree2, genetrees, index):
                 # are decisive and is_quartet_reliable is True.
                 pval = test_p1_equivalence(q)
                 if pval < ALPHA_QUARTET:
+                    _profile_count("ghost_created_create_full_multi", len(rev_placements[p]))
                     ghosts_collected.extend([[p, pval] for p in rev_placements[p]])
                     continue
 
@@ -1480,8 +1704,8 @@ def infer_tree(leaves, genetrees, index, ghosts=None):
     tree2, index, ghosts = infer_tree(set2, genetrees, index, ghosts)
     placements = {}
     merge_trees(genetrees,
-                read_tree_newick(tree1.newick()),
-                read_tree_newick(tree2.newick()),
+                copy_tree(tree1),
+                copy_tree(tree2),
                 placements, ghosts)
     rev_placements = {}
     for p in placements:
@@ -1510,7 +1734,7 @@ def merge_all_subtrees(input_trees, genetrees, index, ghosts = []):
         tree2 = input_trees[i+mid]
         vprint(tree1)
         vprint(tree2)
-        merge_trees(genetrees, read_tree_newick(tree1.newick()), read_tree_newick(tree2.newick()), placements, ghosts)
+        merge_trees(genetrees, copy_tree(tree1), copy_tree(tree2), placements, ghosts)
         # print(ghosts)
         vprint(placements)
 
@@ -1531,12 +1755,43 @@ def merge_all_subtrees(input_trees, genetrees, index, ghosts = []):
     return merge_all_subtrees(new_trees, genetrees, index, ghosts)
 
 def main():
+	global VERBOSE
+	global PROFILE
+	global ASTRAL_CMD
+	global ASTRAL_SEED
+	global ASTRAL_THREADS
+	global ADAPTIVE_QUARTETS
+	global ADAPTIVE_MIN_TREES
+	global ADAPTIVE_STEP
+	global ADAPTIVE_MARGIN
+	global ADAPTIVE_ALPHA
+	global COUNTER_MODE
 	parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 	parser.add_argument('-t', '--trees', required=True, help="Input Trees")
 	parser.add_argument('-s', '--seed', required=False, default=1142, help="Random Seed")
 	parser.add_argument('-m', '--min_size', required=False, default="sqrt", help="Minimum size of each subtree")
 	parser.add_argument("-v", "--verbose", action="store_true", help="enable verbose output")
 	parser.add_argument('--start_tree', required=False, help="Start tree")
+	parser.add_argument('--astral_cmd', default=os.environ.get("ASTRAL4_CMD", "astral4"),
+	                    help="ASTRAL executable path or command name")
+	parser.add_argument('--astral_seed', default=os.environ.get("ASTRAL4_SEED"),
+	                    help="ASTRAL pseudorandom seed; defaults to --seed")
+	parser.add_argument('--astral_threads', type=int, default=ASTRAL_THREADS,
+	                    help="Number of threads to pass to ASTRAL4")
+	parser.add_argument('--profile', action="store_true",
+	                    help="Print runtime profiling by major QTMerge step to stderr")
+	parser.add_argument('--counter', choices=["auto", "python", "fast", "validate"], default=COUNTER_MODE,
+	                    help="Quartet counter implementation")
+	parser.add_argument('--adaptive_quartets', choices=["off", "placement", "all"], default=os.environ.get("QTMERGE_ADAPTIVE_QUARTETS", "off"),
+	                    help="Use adaptive early-stopping for quartet counts")
+	parser.add_argument('--adaptive_min_trees', type=int, default=ADAPTIVE_MIN_TREES,
+	                    help="Minimum gene trees to count before adaptive early-stopping")
+	parser.add_argument('--adaptive_step', type=int, default=ADAPTIVE_STEP,
+	                    help="Adaptive quartet-count checkpoint interval")
+	parser.add_argument('--adaptive_margin', type=float, default=ADAPTIVE_MARGIN,
+	                    help="Minimum dominant-vs-runner-up count margin fraction for adaptive early-stopping")
+	parser.add_argument('--adaptive_alpha', type=float, default=ADAPTIVE_ALPHA,
+	                    help="Minimum conservative p-value for adaptive early-stopping")
 	parser.add_argument('--prune', action="store_true",
 	                    help="Use pruned ASTRAL: iteratively remove the smallest "
 	                         "quadripartition of unreliable branches (1-exp(-l)<0.05) "
@@ -1549,8 +1804,17 @@ def main():
 	parser.add_argument('-o', '--outfile', required=False, default='./temp', help="Output file")
 
 	args = parser.parse_args()
-	global VERBOSE
 	VERBOSE = args.verbose
+	PROFILE = args.profile
+	ASTRAL_CMD = args.astral_cmd
+	ASTRAL_SEED = args.astral_seed if args.astral_seed is not None else args.seed
+	ASTRAL_THREADS = args.astral_threads
+	COUNTER_MODE = args.counter
+	ADAPTIVE_QUARTETS = args.adaptive_quartets
+	ADAPTIVE_MIN_TREES = args.adaptive_min_trees
+	ADAPTIVE_STEP = args.adaptive_step
+	ADAPTIVE_MARGIN = args.adaptive_margin
+	ADAPTIVE_ALPHA = args.adaptive_alpha
 
 	random.seed(a=int(args.seed))
 	np.random.seed(int(args.seed))
@@ -1563,16 +1827,20 @@ def main():
 
 	start = time.time()
 
+	_prof = _profile_enter("input_read_parse")
 	with open(args.trees, "r") as f:
 		trees = f.readlines()
 		trees = [read_tree_newick(t) for t in trees]
-		preprocessed = preprocess_trees(trees) 
+	_profile_exit("input_read_parse", _prof)
+	preprocessed = preprocess_trees(trees)
 
+	_prof = _profile_enter("collect_and_label_leaves")
 	leaves = set()
 	for t in trees:
 		__label_tree__(t)
 		leaves |= set([l.label for l in t.traverse_leaves()])
-	leaves = [l for l in leaves]
+	leaves = sorted(leaves)
+	_profile_exit("collect_and_label_leaves", _prof)
 
 
 	if args.min_size == "sqrt":
@@ -1588,9 +1856,10 @@ def main():
 		if args.start_tree:
 			inferred_tree = read_tree_newick(args.start_tree)
 		else:
-			inferred_tree, _, ghosts = get_astral_tree(trees, leaves)
+			inferred_tree, _, ghosts = get_astral_tree(preprocessed, leaves)
 			# _, index = __label_tree__(inferred_tree, index)
 	else:
+		_prof = _profile_enter("create_initial_subtrees")
 		index = 0
 		input_trees = []
 		if args.prune:
@@ -1604,16 +1873,19 @@ def main():
 				batch = random.sample(pool, m)
 				batch_set = set(batch)
 				pool = [t for t in pool if t not in batch_set]
-				tree, index, g = get_astral_tree_pruned(trees, batch, index)
+				tree, index, g = get_astral_tree_pruned(preprocessed, batch, index)
+				_profile_count("ghost_created_prune_reentered", len(g))
 				pool = g + pool   # pruned taxa re-enter pool for future batches
 				# ghosts += g
 				input_trees.append(tree)
 			# Last batch: remaining taxa; ghosts here are permanent
 			if pool:
 				if len(pool) < 4:
+					_profile_count("ghost_created_initial_small_pool", len(pool))
 					ghosts += [[p, 1] for p in pool]
 				else:
-					tree, index, g = get_astral_tree_pruned(trees, pool, index)
+					tree, index, g = get_astral_tree_pruned(preprocessed, pool, index)
+					_profile_count("ghost_created_prune_final", len(g))
 					ghosts += [[p, 1] for p in g]
 					input_trees.append(tree)
 		else:
@@ -1625,12 +1897,14 @@ def main():
 				if args.start_tree:
 					tree, index = get_subtree(args.start_tree, taxa_subsets[i], index)
 				else:
-					tree, index, g = get_astral_tree(trees, taxa_subsets[i], index)
+					tree, index, g = get_astral_tree(preprocessed, taxa_subsets[i], index)
 					_, index = __label_tree__(tree, index)
+					_profile_count("ghost_created_initial_astral", len(g))
 					ghosts += g
 				# print(tree)
 				input_trees.append(tree)
 		# return
+		_profile_exit("create_initial_subtrees", _prof)
 
 		vprint("+" * 300)
 		vprint("Merging Subtrees")
@@ -1643,26 +1917,33 @@ def main():
 	vprint(inferred_tree)
 
 	ghosts = sorted(ghosts, key=lambda t: t[1])[::-1]
+	_profile_count("ghost_queue_before_reliable", len(ghosts))
 	# ghosts = [g[0] for g in ghosts]
 	# print(len(ghosts))
 
 	num_leaves = compute_num_leaves(inferred_tree)
 
 	repeat = True
+	_prof = _profile_enter("ghost_placement_reliable")
 	while repeat and len(ghosts) > 0: 
 		repeat = False
 	# for l in ghosts:
 		n = len(ghosts)
+		_profile_count("ghost_reliable_passes")
+		_profile_count("ghost_reliable_pass_queue_total", n)
 		for _ in range(n):
 			l = ghosts.pop(0)
+			_profile_count("ghost_reliable_attempts")
 			vprint("=" * 300)
 			taxa = l[0]
 			pval = l[1]
 			vprint(taxa, pval)
 			node, pval = find_taxon_placement_new(taxa, inferred_tree, num_leaves, preprocessed, test = True)
 			if not node:
+				_profile_count("ghost_reliable_retries")
 				ghosts.append([taxa,pval])
 				continue
+			_profile_count("ghost_reliable_placed")
 			repeat = True
 			vprint(node.label)
 			parent = node.parent
@@ -1679,19 +1960,24 @@ def main():
 			num_leaves[parent] += 1
 
 			vprint(inferred_tree)
+	_profile_exit("ghost_placement_reliable", _prof)
 
 	vprint("placing the rest:")
 	# print(ghosts)
 	ghosts = sorted(ghosts, key=lambda t: t[1])[::-1]
+	_profile_count("ghost_queue_before_forced", len(ghosts))
 	# print(ghosts)
 	if len(ghosts) > 0:
+		_prof = _profile_enter("ghost_placement_forced")
 		vprint(len(ghosts))
 		for l in ghosts:
+			_profile_count("ghost_forced_attempts")
 			vprint("=" * 300)
 			taxa = l[0]
 			pval = l[1]
 			vprint(taxa, pval)
 			node, pval = find_taxon_placement_new(taxa, inferred_tree, num_leaves, preprocessed, test = False)
+			_profile_count("ghost_forced_placed")
 			vprint(node.label)
 			parent = node.parent
 			parent.remove_child(node)
@@ -1707,14 +1993,37 @@ def main():
 			num_leaves[parent] += 1
 
 			vprint(inferred_tree)
+		_profile_exit("ghost_placement_forced", _prof)
 
+	_prof = _profile_enter("write_output")
 	inferred_tree.write_tree_newick(args.outfile)
+	_profile_exit("write_output", _prof)
 	# print(inferred_tree)
 
 	end = time.time()
 
 	print(end - start)
+	_print_profile(end - start)
 
+
+
+preprocess_trees = _profiled("preprocess_trees", preprocess_trees)
+copy_tree = _profiled("copy_tree", copy_tree)
+fast_extract = _profiled("fast_extract", fast_extract)
+get_astral_tree_pruned = _profiled("get_astral_tree_pruned", get_astral_tree_pruned)
+get_astral_tree = _profiled("get_astral_tree", get_astral_tree)
+get_subtree = _profiled("get_subtree", get_subtree)
+count_all_topos = _profiled("count_all_topos", count_all_topos)
+compute_num_leaves = _profiled("compute_num_leaves", compute_num_leaves)
+compute_leaf_labels = _profiled("compute_leaf_labels", compute_leaf_labels)
+compute_leaf_labels_and_num_leaves = _profiled("compute_leaf_labels_and_num_leaves", compute_leaf_labels_and_num_leaves)
+find_taxon_placement_new = _profiled("find_taxon_placement_new", find_taxon_placement_new)
+reroot_middle = _profiled("reroot_middle", reroot_middle)
+create_subtrees = _profiled("create_subtrees", create_subtrees)
+divide_tree = _profiled("divide_tree", divide_tree)
+merge_trees = _profiled("merge_trees", merge_trees)
+create_full_tree = _profiled("create_full_tree", create_full_tree)
+merge_all_subtrees = _profiled("merge_all_subtrees", merge_all_subtrees)
 
 
 if __name__ == "__main__":
