@@ -56,7 +56,7 @@ tree (`s_tree.trees`) for a 101-taxon dataset.
 Infer a species tree and compare it to the true tree:
 
 ```bash
-qtmerge -t Example/truegenetrees -o Example/qtmerge_tree.trees
+qtmerge -t Example/truegenetrees -o Example/qtmerge_tree.trees -v
 ```
 
 The output `Example/qtmerge_tree.trees` can be compared to `Example/s_tree.trees` using any
