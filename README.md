@@ -11,7 +11,7 @@ and then recursively merges the subtrees using quartet signal from the gene tree
 **Step 1 — install ASTRAL via bioconda** (required external dependency):
 
 ```bash
-conda install -c bioconda -c conda-forge astral
+conda install -c bioconda -c conda-forge aster
 ```
 
 **Step 2 — install QTMerge**:
